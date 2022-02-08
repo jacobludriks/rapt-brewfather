@@ -175,6 +175,14 @@
 						{
 							"name": "FUNCTIONS_WORKER_RUNTIME",
 							"value": "dotnet"
+						},
+						{
+							"name": "RaptUsername",
+							"value": "[concat('@Microsoft.KeyVault(VaultName=', variables('keyVaultName'), ';SecretName=username')]"
+						},
+						{
+							"name": "RaptApiKey",
+							"value": "[concat('@Microsoft.KeyVault(VaultName=', variables('keyVaultName'), ';SecretName=apikey')]"
 						}
 					],
 					"netFrameworkVersion": "v6.0"

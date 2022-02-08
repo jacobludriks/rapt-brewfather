@@ -8,11 +8,20 @@ using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Extensions.Logging;
 using Azure.Security.KeyVault.Secrets;
 using Azure.Identity;
+using System.Text.Json;
 
 namespace RaptBrewfather
 {
+    public class BearerTokenResponse {
+        public string access_token { get; set; }
+        public int expires_in { get; set; }
+        public string token_type { get; set; }
+        public string scope { get; set; }
+    }
     public static class SendTelemetry
     {
+        static readonly HttpClient httpClient = new HttpClient();
+
         [FunctionName("SendTelemetry")]
         public static async Task<List<string>> RunOrchestrator(
             [OrchestrationTrigger] IDurableOrchestrationContext context)
@@ -23,13 +32,40 @@ namespace RaptBrewfather
         }
 
         [FunctionName("CheckRaptBearerToken")]
-        public static bool CheckRaptBearerToken(ILogger log) {
+        public static async Task<bool> CheckRaptBearerToken(ILogger log) {
             string keyVaultUri = System.Environment.GetEnvironmentVariable("KeyVaultUri", System.EnvironmentVariableTarget.Process);
 
             var secretClient = new SecretClient(new System.Uri(keyVaultUri), new DefaultAzureCredential());
             KeyVaultSecret accessToken = secretClient.GetSecret("accesstoken");
             if (accessToken.Properties.ExpiresOn < System.DateTimeOffset.UtcNow) {
-                // Get a new access token
+                try {
+                    // Create the body of the request
+                    var data = new List<KeyValuePair<string, string>>();
+                    data.Add(new KeyValuePair<string, string>("client_id", "rapt-user"));
+                    data.Add(new KeyValuePair<string, string>("grant_type","password"));
+                    data.Add(new KeyValuePair<string, string>("username",System.Environment.GetEnvironmentVariable("RaptUsername", System.EnvironmentVariableTarget.Process)));
+                    data.Add(new KeyValuePair<string, string>("password",System.Environment.GetEnvironmentVariable("RaptApiKey", System.EnvironmentVariableTarget.Process)));
+
+                    var req = new HttpRequestMessage(HttpMethod.Post, "https://id.rapt.io/connect/token"){
+                        Content = new FormUrlEncodedContent(data)
+                    };
+
+                    var res = await httpClient.SendAsync(req);
+                    string response = await res.Content.ReadAsStringAsync();
+
+                    // Parse the JSON response
+                    BearerTokenResponse bearerTokenResponse = JsonSerializer.Deserialize<BearerTokenResponse>(response);
+
+                    // Create a new version of the secret
+                    KeyVaultSecret updatedSecret = new KeyVaultSecret("accesstoken", bearerTokenResponse.access_token);
+                    updatedSecret.Properties.ExpiresOn = System.DateTimeOffset.UtcNow.AddSeconds(bearerTokenResponse.expires_in);
+
+                    // Commit the new version of the secret
+                    KeyVaultSecret update = secretClient.SetSecret(updatedSecret);
+                }
+                catch {
+                    // ok
+                }
                 return true;
             }
             else {
