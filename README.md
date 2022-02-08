@@ -1,0 +1,1 @@
+This template will integrate a Kegland RAPT Pill with the Brewfather ecosystem using a custom stream.

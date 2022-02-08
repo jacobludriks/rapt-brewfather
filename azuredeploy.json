@@ -1,0 +1,201 @@
+{
+	"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+	"contentVersion": "1.0.0.0",
+	"parameters": {
+		"username": {
+			"type": "string",
+			"metadata": {
+				"description": "The username for the RAPT service"
+			}
+		},
+		"apikey": {
+			"type": "string",
+			"metadata": {
+				"description": "The API key that has been generated for the RAPT service"
+			}
+		}
+	},
+	"variables": {
+		"hostingPlanName": "[toLower(concat('asp-rapt-',uniqueString(resourceGroup().id)))]",
+		"storageAccountName": "[take(toLower(concat('sarapt',uniqueString(resourceGroup().id))),24)]",
+		"functionName": "[toLower(concat('fa-rapt-',uniqueString(resourceGroup().id)))]",
+		"applicationInsightsName": "[toLower(concat('ai-rapt-',uniqueString(resourceGroup().id)))]",
+		"workspaceName": "[toLower(concat('ws-rapt-',uniqueString(resourceGroup().id)))]",
+		"keyVaultName": "[toLower(concat('kv-rapt-',uniqueString(resourceGroup().id)))]",
+		"keyVaultSecretsOfficerRole": "b86a8fe4-44ce-4948-aee5-eccb2c155cd7"
+	},
+	"resources": [
+		{
+			"type": "Microsoft.KeyVault/vaults",
+			"apiVersion": "2019-09-01",
+			"name": "[variables('keyVaultName')]",
+			"location": "[resourceGroup().location]",
+			"properties": {
+				"enableRbacAuthorization": true,
+				"enableSoftDelete": false,
+				"sku": {
+					"family": "A",
+					"name": "standard"
+				},
+				"tenantId": "[subscription().tenantId]"
+			},
+			"resources": [
+				{
+					"type": "secrets",
+					"apiVersion": "2019-09-01",
+					"name": "accesstoken",
+					"dependsOn": [
+						"[concat('Microsoft.KeyVault/vaults/', variables('keyVaultName'))]"
+					],
+					"properties": {
+						"value": "initialvalue",
+						"attributes": {
+							"exp": 1640955600
+						}
+					}
+				},
+				{
+					"type": "secrets",
+					"apiVersion": "2019-09-01",
+					"name": "username",
+					"dependsOn": [
+						"[concat('Microsoft.KeyVault/vaults/', variables('keyVaultName'))]"
+					],
+					"properties": {
+						"value": "[parameters('username')]"
+					}
+				},
+				{
+					"type": "secrets",
+					"apiVersion": "2019-09-01",
+					"name": "apikey",
+					"dependsOn": [
+						"[concat('Microsoft.KeyVault/vaults/', variables('keyVaultName'))]"
+					],
+					"properties": {
+						"value": "[parameters('apikey')]"
+					}
+				}
+			]
+		},
+		{
+			"type": "Microsoft.OperationalInsights/workspaces",
+			"name": "[variables('workspaceName')]",
+			"apiVersion": "2021-06-01",
+			"location": "[resourceGroup().location]",
+			"properties": {
+				"sku": {
+					"name": "PerGB2018"
+				},
+				"retentionInDays": 30
+			}
+		},
+		{
+			"type": "Microsoft.Insights/components",
+			"name": "[variables('applicationInsightsName')]",
+			"apiVersion": "2020-02-02-preview",
+			"location": "[resourceGroup().location]",
+			"kind": "web",
+			"dependsOn": [
+				"[concat('Microsoft.OperationalInsights/workspaces/', variables('workspaceName'))]"
+			],
+			"properties": {
+				"Application_Type": "web",
+				"Flow_Type": "Bluefield",
+				"Request_Source": "rest",
+				"WorkspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces/',variables('workspaceName'))]"
+			}
+		},
+		{
+			"type": "Microsoft.Storage/storageAccounts",
+			"name": "[variables('storageAccountName')]",
+			"apiVersion": "2019-06-01",
+			"location": "[resourceGroup().location]",
+			"kind": "StorageV2",
+			"sku": {
+				"name": "Standard_LRS"
+			},
+			"properties": {
+				"supportsHttpsTrafficOnly": true,
+				"minimumTlsVersion": "TLS1_2"
+			}
+		},
+		{
+			"type": "Microsoft.Web/serverfarms",
+			"apiVersion": "2021-02-01",
+			"name": "[variables('hostingPlanName')]",
+			"location": "[resourceGroup().location]",
+			"sku": {
+				"tier": "Dynamic",
+				"name": "Y1"
+			},
+			"properties": {
+				"workerSize": 0,
+				"workerSizeId": 0,
+				"numberOfWorkers": 1
+			}
+		},
+		{
+			"type": "Microsoft.Web/sites",
+			"apiVersion": "2021-02-01",
+			"name": "[variables('functionName')]",
+			"location": "[resourceGroup().location]",
+			"kind": "functionapp",
+			"identity": {
+				"type": "SystemAssigned"
+			},
+			"dependsOn": [
+				"[concat('Microsoft.Web/serverfarms/', variables('hostingPlanName'))]",
+				"[concat('Microsoft.Insights/components/', variables('applicationInsightsName'))]",
+				"[concat('Microsoft.Storage/storageAccounts/', variables('storageAccountName'))]"
+			],
+			"properties": {
+				"siteConfig": {
+					"appSettings": [
+						{
+							"name": "AzureWebJobsStorage",
+							"value": "[concat('DefaultEndpointsProtocol=https;AccountName=',variables('storageAccountName'),';AccountKey=',listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2019-06-01').keys[0].value,';EndpointSuffix=','core.windows.net')]"
+						},
+						{
+							"name": "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING",
+							"value": "[concat('DefaultEndpointsProtocol=https;AccountName=',variables('storageAccountName'),';AccountKey=',listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2019-06-01').keys[0].value,';EndpointSuffix=','core.windows.net')]"
+						},
+						{
+							"name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
+							"value": "[reference(concat('microsoft.insights/components/',variables('applicationInsightsName')), '2015-05-01').ConnectionString]"
+						},
+						{
+							"name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+							"value": "[reference(concat('microsoft.insights/components/',variables('applicationInsightsName')), '2015-05-01').InstrumentationKey]"
+						},
+						{
+							"name": "FUNCTIONS_EXTENSION_VERSION",
+							"value": "~4"
+						},
+						{
+							"name": "FUNCTIONS_WORKER_RUNTIME",
+							"value": "dotnet"
+						}
+					],
+					"netFrameworkVersion": "v6.0"
+				},
+				"serverFarmId": "[concat('/subscriptions/', subscription().subscriptionId, '/resourcegroups/', resourceGroup().id, '/providers/Microsoft.Web/serverfarms/', variables('hostingPlanName'))]"
+			}
+		},
+		{
+			"type": "Microsoft.Authorization/roleAssignments",
+			"apiVersion": "2020-08-01-preview",
+			"name": "[guid(subscription().id, variables('functionName'), variables('keyVaultSecretsOfficerRole'))]",
+			"scope": "[concat('Microsoft.KeyVault/vaults/', variables('keyVaultName'))]",
+			"dependsOn": [
+				"[concat('Microsoft.KeyVault/vaults/', variables('keyVaultName'))]",
+				"[concat('Microsoft.Web/sites/', variables('functionName'))]"
+			],
+			"properties": {
+				"principalType": "ServicePrincipal",
+				"principalId": "[reference(resourceId('Microsoft.Web/sites', variables('functionName')), '2021-02-01', 'Full').identity.principalId]",
+				"roleDefinitionId": "[variables('keyVaultSecretsOfficerRole')]"
+			}
+		}
+	]
+}
