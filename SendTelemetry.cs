@@ -9,109 +9,150 @@ using System.Threading.Tasks;
 using System.Collections.Generic;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Linq;
 
 namespace RaptBrewfather
 {
     public class SendTelemetry
     {
-        static readonly HttpClient httpClient = new HttpClient();
+        static HttpClient _httpClient = new HttpClient();
 
         [FunctionName("SendTelemetry")]
-        public void Run([TimerTrigger("0 */20 * * * *")]TimerInfo myTimer, ILogger log)
+        public async void Run([TimerTrigger("0 */20 * * * *")]TimerInfo myTimer, ILogger log)
         {
+            var token = await CheckRaptBearerToken(_httpClient, log);
+            var hydrometers = await GetHydrometers(_httpClient, log);
+            foreach (var hydrometer in hydrometers) {
+                var telemetry = await GetHydrometerTelemetry(_httpClient, hydrometer, log);
+                await PublishBrewfatherTelemetry(_httpClient, "uri", telemetry, log);
+            }
+
             log.LogInformation($"C# Timer trigger function executed at: {DateTime.Now}");
         }
 
-        public static async Task<bool> CheckRaptBearerToken(ILogger log) {
+        public static async Task<bool> CheckRaptBearerToken(HttpClient httpClient, ILogger log) {
+            // Get the Azure Key Vault URI from the application settings on the Azure Function
             string keyVaultUri = System.Environment.GetEnvironmentVariable("KeyVaultUri", System.EnvironmentVariableTarget.Process);
 
-            var secretClient = new SecretClient(new System.Uri(keyVaultUri), new DefaultAzureCredential());
+            // Create a new SecretClient using the Managed Service Identity of the Azure Function, then retrieve the bearer token for the RAPT API
+            SecretClient secretClient = new SecretClient(new System.Uri(keyVaultUri), new DefaultAzureCredential());
             KeyVaultSecret accessToken = secretClient.GetSecret("accesstoken");
+
+            // If the bearer token lifetime has elapsed, retrieve a new bearer token
             if (accessToken.Properties.ExpiresOn < System.DateTimeOffset.UtcNow) {
                 try {
-                    // Create the body of the request
+                    // Create the body of the request for a new bearer token
                     var data = new List<KeyValuePair<string, string>>();
                     data.Add(new KeyValuePair<string, string>("client_id", "rapt-user"));
                     data.Add(new KeyValuePair<string, string>("grant_type","password"));
                     data.Add(new KeyValuePair<string, string>("username",System.Environment.GetEnvironmentVariable("RaptUsername", System.EnvironmentVariableTarget.Process)));
                     data.Add(new KeyValuePair<string, string>("password",System.Environment.GetEnvironmentVariable("RaptApiKey", System.EnvironmentVariableTarget.Process)));
 
+                    // Create the request
                     var req = new HttpRequestMessage(HttpMethod.Post, "https://id.rapt.io/connect/token"){
                         Content = new FormUrlEncodedContent(data)
                     };
 
-                    var res = await httpClient.SendAsync(req);
-                    string response = await res.Content.ReadAsStringAsync();
+                    // Send the request to the RAPT authentication provider
+                    using (var res = await httpClient.SendAsync(req)) {
+                        string response = await res.Content.ReadAsStringAsync();
 
-                    // Parse the JSON response
-                    BearerTokenResponse bearerTokenResponse = JsonSerializer.Deserialize<BearerTokenResponse>(response);
+                        // Parse the JSON response
+                        BearerTokenResponse bearerTokenResponse = JsonSerializer.Deserialize<BearerTokenResponse>(response);
 
-                    // Create a new version of the secret
-                    KeyVaultSecret updatedSecret = new KeyVaultSecret("accesstoken", bearerTokenResponse.access_token);
-                    updatedSecret.Properties.ExpiresOn = System.DateTimeOffset.UtcNow.AddSeconds(bearerTokenResponse.expires_in);
+                        // Create a new version of the bearer token secret
+                        KeyVaultSecret updatedSecret = new KeyVaultSecret("accesstoken", bearerTokenResponse.access_token);
+                        updatedSecret.Properties.ExpiresOn = System.DateTimeOffset.UtcNow.AddSeconds(bearerTokenResponse.expires_in);
 
-                    // Commit the new version of the secret
-                    KeyVaultSecret update = secretClient.SetSecret(updatedSecret);
+                        // Commit the new version of the bearer token secret
+                        KeyVaultSecret update = secretClient.SetSecret(updatedSecret);
+
+                        // Set the Authorization header on the httpClient object to the new bearer token
+                        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bearerTokenResponse.access_token);
+                    }
                 }
                 catch {
                     // ok
                 }
                 return true;
             }
+            // The bearer token lifetime has not elapsed, so we can continue using it
             else {
+                // Set the Authorization header on the httpClient object to the current bearer token
+                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken.Value);
                 return true;
             }
         }
-        public static async Task<IEnumerable<string>> GetHydrometers(string bearerToken, ILogger log) {
+        public static async Task<IEnumerable<string>> GetHydrometers(HttpClient httpClient, ILogger log) {
+            // Set the URI of the GetHydrometers RAPT API endpoint
             string requestUri = "https://api.rapt.io/api/Hydrometers/GetHydrometers";
-            // Add bearer header
-            var res = await httpClient.GetAsync(requestUri);
-            string response = await res.Content.ReadAsStringAsync();
-            
-            var jsonResponse = JsonDocument.Parse(response);
 
-            var hydrometers = jsonResponse.RootElement.EnumerateObject()
-                                .Where(n => n.Name.Equals("id") && n.Value.ValueKind == JsonValueKind.String)
-                                .Select(s => s.Value.ToString());
+            // Send the request to the RAPT API
+            using (var res = await httpClient.GetAsync(requestUri)) {
+                string response = await res.Content.ReadAsStringAsync();
+                
+                // Parse the JSON response
+                var jsonResponse = JsonDocument.Parse(response);
 
-            return hydrometers;
+                // Get the ID of each hydrometer from the JSON response
+                var hydrometers = jsonResponse.RootElement.EnumerateObject()
+                                    .Where(n => n.Name.Equals("id") && n.Value.ValueKind == JsonValueKind.String)
+                                    .Select(s => s.Value.ToString());
+
+                // Return the list of hydrometer ID's
+                return hydrometers;
+            }
         }
 
-        public static async Task<BrewfatherStream> GetHydrometerTelemetry(string bearerToken, string hydrometerId, ILogger log) {
-            // Get date data
-            // Date should be in this format - 2021-12-20T07:32:46.467Z
+        public static async Task<BrewfatherStream> GetHydrometerTelemetry(HttpClient httpClient, string hydrometerId, ILogger log) {
+            // Set two DateTime objects - now, and one hour ago. Both are in UTC.
+            // The DateTime objects should be in the "s" format, ie. 2022-02-09T08:23:32.165
             DateTime now = DateTime.UtcNow;
             DateTime previous = now.AddHours(-1);
 
-            // Create the body of the request
+            // Create the body of the request for the hydrometer telemetry data
             var data = new List<KeyValuePair<string, string>>();
             data.Add(new KeyValuePair<string, string>("hydrometerId", hydrometerId));
             data.Add(new KeyValuePair<string, string>("startDate", previous.ToString("s")));
             data.Add(new KeyValuePair<string, string>("endDate", now.ToString("s")));
 
-            // Add bearer header
-            
+            // Create the request
             var req = new HttpRequestMessage(HttpMethod.Post, "https://id.rapt.io/connect/token"){
                 Content = new FormUrlEncodedContent(data)
             };
 
-            var res = await httpClient.SendAsync(req);
-            string response = await res.Content.ReadAsStringAsync();
+            // Send the request to the RAPT API
+            using (var res = await httpClient.SendAsync(req)) {
+                string response = await res.Content.ReadAsStringAsync();
 
-            var test = JsonSerializer.Deserialize<List<RaptTelemetry>>(response);
+                // Parse the telemetry data from the API response
+                var telemetry = JsonSerializer.Deserialize<List<RaptTelemetry>>(response);
 
-            var recentResult = test.OrderByDescending(t => t.createdOn).First();
+                // Select only the most recent telemetry from the hydrometer
+                var recentResult = telemetry.OrderByDescending(t => t.createdOn).First();
 
-            var brewfather = new BrewfatherStream(){
-                name = hydrometerId,
-                temp = recentResult.temperature,
-                temp_unit = "C",
-                gravity = Math.Round(recentResult.gravity / 1000, 3),
-                gravity_unit = "G"
-            };
+                // Convert the RAPT API object to a Brewfather API object
+                var brewfather = new BrewfatherStream(){
+                    name = hydrometerId,
+                    temp = recentResult.temperature,
+                    temp_unit = "C",
+                    gravity = Math.Round(recentResult.gravity / 1000, 3),
+                    gravity_unit = "G"
+                };
 
-            return brewfather;
+                // Return the Brewfather API object
+                return brewfather;
+            }
+        }
+
+        public static async Task<bool> PublishBrewfatherTelemetry(HttpClient httpClient, string brewfatherUri, BrewfatherStream stream, ILogger log) {
+            // Send the Brewfather API object to the Brewfather API
+            using (var res = await httpClient.PostAsJsonAsync<BrewfatherStream>(brewfatherUri, stream)) {
+                string response = await res.Content.ReadAsStringAsync();
+                return true;
+            }
         }
     }
 
@@ -125,6 +166,8 @@ namespace RaptBrewfather
 
     public class BrewfatherStream
     {
+        // We do not need most of the fields that the Brewfather API can ingest
+        // We only care about the temperature and gravity. Name is mandatory, and will be set to the hydrometer ID from the RAPT API
         public string name { get; set; }
         public double temp { get; set; }
         public string temp_unit { get; set; }
