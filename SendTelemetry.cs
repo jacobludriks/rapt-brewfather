@@ -20,19 +20,21 @@ namespace RaptBrewfather
         static HttpClient _httpClient = new HttpClient();
 
         [FunctionName("SendTelemetry")]
-        public async void Run([TimerTrigger("0 */20 * * * *")]TimerInfo myTimer, ILogger log)
+        public async Task<bool> Run([TimerTrigger("0 */20 * * * *")]TimerInfo myTimer, ILogger log)
         {
-            var token = await CheckRaptBearerToken(_httpClient, log);
-            var hydrometers = await GetHydrometers(_httpClient, log);
+            string bearerToken = await GetRaptBearerToken(_httpClient, log);
+            var hydrometers = await GetHydrometers(_httpClient, bearerToken, log);
             foreach (var hydrometer in hydrometers) {
-                var telemetry = await GetHydrometerTelemetry(_httpClient, hydrometer, log);
+                var telemetry = await GetHydrometerTelemetry(_httpClient, bearerToken, hydrometer, log);
                 await PublishBrewfatherTelemetry(_httpClient, "uri", telemetry, log);
             }
 
             log.LogInformation($"C# Timer trigger function executed at: {DateTime.Now}");
+
+            return true;
         }
 
-        public static async Task<bool> CheckRaptBearerToken(HttpClient httpClient, ILogger log) {
+        public static async Task<string> GetRaptBearerToken(HttpClient httpClient, ILogger log) {
             // Get the Azure Key Vault URI from the application settings on the Azure Function
             string keyVaultUri = System.Environment.GetEnvironmentVariable("KeyVaultUri", System.EnvironmentVariableTarget.Process);
 
@@ -42,6 +44,7 @@ namespace RaptBrewfather
 
             // If the bearer token lifetime has elapsed, retrieve a new bearer token
             if (accessToken.Properties.ExpiresOn < System.DateTimeOffset.UtcNow) {
+                log.LogInformation("Bearer token has expired, retrieving new token");
                 try {
                     // Create the body of the request for a new bearer token
                     var data = new List<KeyValuePair<string, string>>();
@@ -69,25 +72,29 @@ namespace RaptBrewfather
                         // Commit the new version of the bearer token secret
                         KeyVaultSecret update = secretClient.SetSecret(updatedSecret);
 
-                        // Set the Authorization header on the httpClient object to the new bearer token
-                        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", bearerTokenResponse.access_token);
+                        // Return the new bearer token
+                        return bearerTokenResponse.access_token;
                     }
                 }
                 catch {
                     // ok
                 }
-                return true;
+                return "ok";
             }
             // The bearer token lifetime has not elapsed, so we can continue using it
             else {
-                // Set the Authorization header on the httpClient object to the current bearer token
-                httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken.Value);
-                return true;
+                //Return the current bearer token
+                return accessToken.Value;
             }
         }
-        public static async Task<IEnumerable<string>> GetHydrometers(HttpClient httpClient, ILogger log) {
+        public static async Task<IEnumerable<string>> GetHydrometers(HttpClient httpClient, string bearerToken, ILogger log) {
             // Set the URI of the GetHydrometers RAPT API endpoint
             string requestUri = "https://api.rapt.io/api/Hydrometers/GetHydrometers";
+
+            // Create the request
+            var req = new HttpRequestMessage(HttpMethod.Get, requestUri) {
+                Headers = { Authorization = new AuthenticationHeaderValue("Bearer", bearerToken) }
+            };
 
             // Send the request to the RAPT API
             using (var res = await httpClient.GetAsync(requestUri)) {
@@ -106,7 +113,7 @@ namespace RaptBrewfather
             }
         }
 
-        public static async Task<BrewfatherStream> GetHydrometerTelemetry(HttpClient httpClient, string hydrometerId, ILogger log) {
+        public static async Task<BrewfatherStream> GetHydrometerTelemetry(HttpClient httpClient, string bearerToken, string hydrometerId, ILogger log) {
             // Set two DateTime objects - now, and one hour ago. Both are in UTC.
             // The DateTime objects should be in the "s" format, ie. 2022-02-09T08:23:32.165
             DateTime now = DateTime.UtcNow;
@@ -120,7 +127,8 @@ namespace RaptBrewfather
 
             // Create the request
             var req = new HttpRequestMessage(HttpMethod.Post, "https://id.rapt.io/connect/token"){
-                Content = new FormUrlEncodedContent(data)
+                Content = new FormUrlEncodedContent(data),
+                Headers = { Authorization = new AuthenticationHeaderValue("Bearer", bearerToken) }
             };
 
             // Send the request to the RAPT API
