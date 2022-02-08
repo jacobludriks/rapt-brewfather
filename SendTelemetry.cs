@@ -90,6 +90,8 @@ namespace RaptBrewfather
             data.Add(new KeyValuePair<string, string>("startDate", previous.ToString("s")));
             data.Add(new KeyValuePair<string, string>("endDate", now.ToString("s")));
 
+            // Add bearer header
+            
             var req = new HttpRequestMessage(HttpMethod.Post, "https://id.rapt.io/connect/token"){
                 Content = new FormUrlEncodedContent(data)
             };

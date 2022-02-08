@@ -1,0 +1,3 @@
+# Dont deploy non-function related files
+azuredeploy.json
+README.md
