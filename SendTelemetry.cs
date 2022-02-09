@@ -20,72 +20,91 @@ namespace RaptBrewfather
         static HttpClient _httpClient = new HttpClient();
 
         [FunctionName("SendTelemetry")]
-        public async Task<bool> Run([TimerTrigger("0 */20 * * * *")]TimerInfo myTimer, ILogger log)
+        public async Task Run([TimerTrigger("0 */20 * * * *")]TimerInfo myTimer, ILogger log)
         {
             string bearerToken = await GetRaptBearerToken(_httpClient, log);
             var hydrometers = await GetHydrometers(_httpClient, bearerToken, log);
+            string brewfatherUri = System.Environment.GetEnvironmentVariable("BrewfatherUri", System.EnvironmentVariableTarget.Process);
             foreach (var hydrometer in hydrometers) {
                 var telemetry = await GetHydrometerTelemetry(_httpClient, bearerToken, hydrometer, log);
-                await PublishBrewfatherTelemetry(_httpClient, "uri", telemetry, log);
+                await PublishBrewfatherTelemetry(_httpClient, brewfatherUri, telemetry, log);
             }
 
             log.LogInformation($"C# Timer trigger function executed at: {DateTime.Now}");
-
-            return true;
         }
 
         public static async Task<string> GetRaptBearerToken(HttpClient httpClient, ILogger log) {
-            // Get the Azure Key Vault URI from the application settings on the Azure Function
-            string keyVaultUri = System.Environment.GetEnvironmentVariable("KeyVaultUri", System.EnvironmentVariableTarget.Process);
+            var env = System.Environment.GetEnvironmentVariable("AZURE_FUNCTIONS_ENVIRONMENT", System.EnvironmentVariableTarget.Process);
 
-            // Create a new SecretClient using the Managed Service Identity of the Azure Function, then retrieve the bearer token for the RAPT API
-            SecretClient secretClient = new SecretClient(new System.Uri(keyVaultUri), new DefaultAzureCredential());
-            KeyVaultSecret accessToken = secretClient.GetSecret("accesstoken");
+            if (env == "Production") {
+                // Get the Azure Key Vault URI from the application settings on the Azure Function
+                string keyVaultUri = System.Environment.GetEnvironmentVariable("KeyVaultUri", System.EnvironmentVariableTarget.Process);
 
+                // Create a new SecretClient using the Managed Service Identity of the Azure Function, then retrieve the bearer token for the RAPT API
+                SecretClient secretClient = new SecretClient(new System.Uri(keyVaultUri), new DefaultAzureCredential());
+                KeyVaultSecret accessToken = secretClient.GetSecret("accesstoken");
+
+                // Set the secret to expired if
+                if (accessToken.Properties.ExpiresOn < System.DateTimeOffset.UtcNow == false) {
+                    return accessToken.Value;
+                }
+            }
+            
             // If the bearer token lifetime has elapsed, retrieve a new bearer token
-            if (accessToken.Properties.ExpiresOn < System.DateTimeOffset.UtcNow) {
-                log.LogInformation("Bearer token has expired, retrieving new token");
-                try {
-                    // Create the body of the request for a new bearer token
-                    var data = new List<KeyValuePair<string, string>>();
-                    data.Add(new KeyValuePair<string, string>("client_id", "rapt-user"));
-                    data.Add(new KeyValuePair<string, string>("grant_type","password"));
-                    data.Add(new KeyValuePair<string, string>("username",System.Environment.GetEnvironmentVariable("RaptUsername", System.EnvironmentVariableTarget.Process)));
-                    data.Add(new KeyValuePair<string, string>("password",System.Environment.GetEnvironmentVariable("RaptApiKey", System.EnvironmentVariableTarget.Process)));
+            log.LogInformation("Bearer token has expired, retrieving new token");
+            try {
+                // Create the body of the request for a new bearer token
+                var data = new List<KeyValuePair<string, string>>();
+                data.Add(new KeyValuePair<string, string>("client_id", "rapt-user"));
+                data.Add(new KeyValuePair<string, string>("grant_type","password"));
+                data.Add(new KeyValuePair<string, string>("username",System.Environment.GetEnvironmentVariable("RaptUsername", System.EnvironmentVariableTarget.Process)));
+                data.Add(new KeyValuePair<string, string>("password",System.Environment.GetEnvironmentVariable("RaptApiKey", System.EnvironmentVariableTarget.Process)));
 
-                    // Create the request
-                    var req = new HttpRequestMessage(HttpMethod.Post, "https://id.rapt.io/connect/token"){
-                        Content = new FormUrlEncodedContent(data)
-                    };
+                // Create the request
+                var req = new HttpRequestMessage(HttpMethod.Post, "https://id.rapt.io/connect/token"){
+                    Content = new FormUrlEncodedContent(data)
+                };
 
-                    // Send the request to the RAPT authentication provider
-                    using (var res = await httpClient.SendAsync(req)) {
-                        string response = await res.Content.ReadAsStringAsync();
+                // Send the request to the RAPT authentication provider
+                using (var res = await httpClient.SendAsync(req)) {
+                    if (res.Content == null) {
+                        // Error out
+                    }
+                    string response = await res.Content.ReadAsStringAsync();
 
-                        // Parse the JSON response
-                        BearerTokenResponse bearerTokenResponse = JsonSerializer.Deserialize<BearerTokenResponse>(response);
+                    // Parse the JSON response
+                    BearerTokenResponse bearerTokenResponse = JsonSerializer.Deserialize<BearerTokenResponse>(response);
+                    if (bearerTokenResponse == null) {
+                        // Do something
+                    }
 
+                    if (env == "Production") {
                         // Create a new version of the bearer token secret
                         KeyVaultSecret updatedSecret = new KeyVaultSecret("accesstoken", bearerTokenResponse.access_token);
                         updatedSecret.Properties.ExpiresOn = System.DateTimeOffset.UtcNow.AddSeconds(bearerTokenResponse.expires_in);
 
+                        // Get the Azure Key Vault URI from the application settings on the Azure Function
+                        string keyVaultUri = System.Environment.GetEnvironmentVariable("KeyVaultUri", System.EnvironmentVariableTarget.Process);
+
+                        // Create a new SecretClient using the Managed Service Identity of the Azure Function, then retrieve the bearer token for the RAPT API
+                        SecretClient secretClient = new SecretClient(new System.Uri(keyVaultUri), new DefaultAzureCredential());
+
                         // Commit the new version of the bearer token secret
                         KeyVaultSecret update = secretClient.SetSecret(updatedSecret);
-
-                        // Return the new bearer token
-                        return bearerTokenResponse.access_token;
                     }
+
+                    // Return the new bearer token
+                    return bearerTokenResponse.access_token;
                 }
-                catch {
-                    // ok
-                }
-                return "ok";
             }
-            // The bearer token lifetime has not elapsed, so we can continue using it
-            else {
-                //Return the current bearer token
-                return accessToken.Value;
+            catch (HttpRequestException exception) {
+                log.LogError(exception, "It broked");
+                // We should probably retry
             }
+            catch (Exception exception) {
+                log.LogError(exception, "Unhandled exception");
+            }
+            return "ok";
         }
         public static async Task<IEnumerable<string>> GetHydrometers(HttpClient httpClient, string bearerToken, ILogger log) {
             // Set the URI of the GetHydrometers RAPT API endpoint
@@ -97,14 +116,16 @@ namespace RaptBrewfather
             };
 
             // Send the request to the RAPT API
-            using (var res = await httpClient.GetAsync(requestUri)) {
+            using (var res = await httpClient.SendAsync(req)) {
                 string response = await res.Content.ReadAsStringAsync();
                 
                 // Parse the JSON response
                 var jsonResponse = JsonDocument.Parse(response);
 
                 // Get the ID of each hydrometer from the JSON response
-                var hydrometers = jsonResponse.RootElement.EnumerateObject()
+                var hydrometers = jsonResponse.RootElement
+                                    .EnumerateArray()
+                                    .SelectMany(o => o.EnumerateObject())
                                     .Where(n => n.Name.Equals("id") && n.Value.ValueKind == JsonValueKind.String)
                                     .Select(s => s.Value.ToString());
 
@@ -126,7 +147,7 @@ namespace RaptBrewfather
             data.Add(new KeyValuePair<string, string>("endDate", now.ToString("s")));
 
             // Create the request
-            var req = new HttpRequestMessage(HttpMethod.Post, "https://id.rapt.io/connect/token"){
+            var req = new HttpRequestMessage(HttpMethod.Get, "https://api.rapt.io/api/Hydrometers/GetTelemetry"){
                 Content = new FormUrlEncodedContent(data),
                 Headers = { Authorization = new AuthenticationHeaderValue("Bearer", bearerToken) }
             };

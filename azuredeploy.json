@@ -13,6 +13,12 @@
 			"metadata": {
 				"description": "The API key that has been generated for the RAPT service"
 			}
+		},
+		"brewfatheruri": {
+			"type": "string",
+			"metadata": {
+				"description": "The URI of the Brewfather Stream service"
+			}
 		}
 	},
 	"variables": {
@@ -22,7 +28,7 @@
 		"applicationInsightsName": "[toLower(concat('ai-rapt-',uniqueString(resourceGroup().id)))]",
 		"workspaceName": "[toLower(concat('ws-rapt-',uniqueString(resourceGroup().id)))]",
 		"keyVaultName": "[toLower(concat('kv-rapt-',uniqueString(resourceGroup().id)))]",
-		"keyVaultSecretsOfficerRole": "b86a8fe4-44ce-4948-aee5-eccb2c155cd7"
+		"keyVaultSecretsOfficerRole": "[concat('/subscriptions/', subscription().subscriptionId, '/providers/Microsoft.Authorization/roleDefinitions/', 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7')]"
 	},
 	"resources": [
 		{
@@ -177,12 +183,24 @@
 							"value": "dotnet"
 						},
 						{
+							"name": "AZURE_FUNCTIONS_ENVIRONMENT",
+							"value": "Production"
+						},
+						{
 							"name": "RaptUsername",
 							"value": "[concat('@Microsoft.KeyVault(VaultName=', variables('keyVaultName'), ';SecretName=username')]"
 						},
 						{
 							"name": "RaptApiKey",
 							"value": "[concat('@Microsoft.KeyVault(VaultName=', variables('keyVaultName'), ';SecretName=apikey')]"
+						},
+						{
+							"name": "KeyVaultUri",
+							"value": "[concat('https://', variables('keyVaultName'), '.vault.azure.net/')]"
+						},
+						{
+							"name": "BrewfatherUri",
+							"value": "[parameters('brewfatheruri')]"
 						}
 					],
 					"netFrameworkVersion": "v6.0"
@@ -200,7 +218,6 @@
 				"[concat('Microsoft.Web/sites/', variables('functionName'))]"
 			],
 			"properties": {
-				"principalType": "ServicePrincipal",
 				"principalId": "[reference(resourceId('Microsoft.Web/sites', variables('functionName')), '2021-02-01', 'Full').identity.principalId]",
 				"roleDefinitionId": "[variables('keyVaultSecretsOfficerRole')]"
 			}
