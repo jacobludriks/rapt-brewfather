@@ -28,10 +28,15 @@ namespace RaptBrewfather
         {
             string bearerToken = await GetRaptBearerToken(_httpClient, log);
             var hydrometers = await GetHydrometers(_httpClient, bearerToken, log);
-            string brewfatherUri = System.Environment.GetEnvironmentVariable("BrewfatherUri", System.EnvironmentVariableTarget.Process);
-            foreach (var hydrometer in hydrometers) {
-                var telemetry = await GetHydrometerTelemetry(_httpClient, bearerToken, hydrometer, log);
-                await PublishBrewfatherTelemetry(_httpClient, brewfatherUri, telemetry, log);
+            if (hydrometers == null) {
+                log.LogError("No hydrometers, skipping run");
+            }
+            else {
+                string brewfatherUri = System.Environment.GetEnvironmentVariable("BrewfatherUri", System.EnvironmentVariableTarget.Process);
+                foreach (var hydrometer in hydrometers) {
+                    var telemetry = await GetHydrometerTelemetry(_httpClient, bearerToken, hydrometer, log);
+                    await PublishBrewfatherTelemetry(_httpClient, brewfatherUri, telemetry, log);
+                }
             }
 
             log.LogInformation($"C# Timer trigger function executed at: {DateTime.Now}");
@@ -50,7 +55,8 @@ namespace RaptBrewfather
                 KeyVaultSecret accessToken = secretClient.GetSecret("accesstoken");
 
                 // If the token is within the expiry window, return the existing token and do not renew it
-                if (accessToken.Properties.ExpiresOn < System.DateTimeOffset.UtcNow.AddMinutes(tokenExpiryWindow)) {
+                if (accessToken.Properties.ExpiresOn > System.DateTimeOffset.UtcNow.AddMinutes(tokenExpiryWindow)) {
+                    log.LogInformation("Bearer token is still valid, returning token");
                     return accessToken.Value;
                 }
             }
@@ -91,6 +97,7 @@ namespace RaptBrewfather
                         }
 
                         // Return the new bearer token
+                        log.LogInformation("Retrieved new bearer token and stored in key vault, returning token");
                         return bearerTokenResponse.access_token;
                     }
                     
